@@ -63,6 +63,7 @@ dependencies {
     implementation(libs.androidx.work.runtime.ktx)
     implementation("com.squareup.okhttp3:okhttp:4.11.0")
     implementation("com.squareup.okio:okio:3.3.0")
+    implementation("com.infobip:google-webrtc:1.0.42469")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
