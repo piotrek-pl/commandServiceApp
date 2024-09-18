@@ -10,7 +10,12 @@ import androidx.core.app.ActivityCompat
 import android.content.pm.PackageManager
 import android.Manifest
 import android.app.Activity
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import org.webrtc.*
+import java.nio.ByteBuffer
+import kotlin.random.Random
 
 class WebRTCManager(private val context: Context) {
 
@@ -68,14 +73,16 @@ class WebRTCManager(private val context: Context) {
             mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "false"))
             mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "false"))
             mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "false"))
+            mandatory.add(MediaConstraints.KeyValuePair("googTypingNoiseDetection", "false"))  // Wyłącz typowe wykrywanie szumu
         }
+
         Log.d("WebRTCManager", "Audio constraints set: $audioConstraints")
 
-        // Tworzymy AudioSource bazujące na MediaConstraints
+        // Tworzenie AudioSource na podstawie tych samych parametrów
         audioSource = peerConnectionFactory.createAudioSource(audioConstraints)
         Log.d("WebRTCManager", "AudioSource created: $audioSource")
 
-        // Tworzymy AudioTrack na podstawie AudioSource
+        // Tworzenie AudioTrack na podstawie AudioSource
         audioTrack = peerConnectionFactory.createAudioTrack("ARDAMSa0", audioSource)
         Log.d("WebRTCManager", "AudioTrack created: ${audioTrack.id()}")
 
@@ -134,7 +141,6 @@ class WebRTCManager(private val context: Context) {
     }
 
     fun startCall(iceServers: List<PeerConnection.IceServer>, observer: PeerConnection.Observer) {
-        // Log do potwierdzenia rozpoczęcia połączenia i rejestrowania dźwięku
         Log.d("WebRTCManager", "Attempting to start call and register audio")
 
         if (audioTrack != null) {
@@ -145,7 +151,56 @@ class WebRTCManager(private val context: Context) {
 
         createPeerConnection(iceServers, observer)
         Log.d("WebRTCManager", "Call started with ICE servers: $iceServers")
+
+        // Zamiast generować dane, uruchamiamy AudioRecord do nagrywania z mikrofonu
+        val bufferSize = AudioRecord.getMinBufferSize(
+            48000, // 48kHz
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            48000,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            bufferSize
+        )
+
+        val audioBuffer = ByteArray(bufferSize)
+
+        if (audioRecord.state == AudioRecord.STATE_INITIALIZED) {
+            audioRecord.startRecording()
+            Log.d("WebRTCManager", "Audio recording started with buffer size: $bufferSize")
+
+            // Uruchamiamy wątek do zbierania danych audio
+            Thread {
+                Log.d("WebRTCManager", "Audio recording thread started")
+                while (true) {
+                    val read = audioRecord.read(audioBuffer, 0, bufferSize)
+                    if (read > 0) {
+                        // Debugowanie danych audio
+                        val maxAmplitude = audioBuffer.maxOrNull() ?: 0
+                        Log.d("WebRTCManager", "Audio data captured: $read bytes, max amplitude: $maxAmplitude")
+                    } else {
+                        Log.d("WebRTCManager", "No audio data captured, read: $read")
+                    }
+                }
+            }.start()
+        } else {
+            Log.e("WebRTCManager", "AudioRecord initialization failed")
+        }
     }
+
+
+    // Funkcja generująca biały szum
+    fun generateWhiteNoise(buffer: ByteArray) {
+        val random = java.util.Random()
+        for (i in buffer.indices) {
+            buffer[i] = (random.nextInt(256) - 128).toByte()  // Generowanie losowych bajtów
+        }
+    }
+
+
 
     fun createOffer(sdpCallback: (String) -> Unit) {
         val mediaConstraints = MediaConstraints()
