@@ -5,10 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.WebSocket
@@ -17,6 +19,8 @@ import okio.ByteString
 import org.webrtc.IceCandidate
 import org.webrtc.PeerConnection
 import org.webrtc.SessionDescription
+import android.Manifest
+import android.graphics.Color
 
 class CommandService : Service() {
 
@@ -35,22 +39,47 @@ class CommandService : Service() {
         super.onCreate()
         Log.d("CommandService", "Service started in onCreate")
 
+        // Utwórz powiadomienie natychmiast po starcie usługi
         createNotificationChannel()
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Service running")
             .setContentText("Service is running after restart.")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)  // Wysoki priorytet
+            .setCategory(NotificationCompat.CATEGORY_SERVICE) // Kategoria powiadomienia
             .build()
 
+        // Musisz wywołać startForeground(), aby zapobiec zakończeniu usługi przez system
         startForeground(1, notification)
 
-        // Initialize WebRTCManager
+        // Sprawdź uprawnienia do nagrywania audio
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+
+            // Wyświetl powiadomienie z prośbą o uprawnienia
+            val permissionNotification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("Permission required")
+                .setContentText("Audio recording permission is required to continue.")
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .build()
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.notify(2, permissionNotification)
+
+            // Zatrzymaj usługę po wyświetleniu powiadomienia
+            stopSelf()
+            return
+        }
+
+        // Jeśli są uprawnienia, kontynuuj działanie usługi
         webRTCManager = WebRTCManager(this)
 
-        // Initialize WebSocket connection
-        connectWebSocket()
+        connectWebSocket()  // Inicjalizacja WebSocket
     }
+
+
+
+
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return START_STICKY
@@ -72,8 +101,14 @@ class CommandService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_DEFAULT
-            )
+                NotificationManager.IMPORTANCE_HIGH // Zmień priorytet na wysoki
+            ).apply {
+                description = "Command Service Channel"
+                enableLights(true)
+                lightColor = Color.RED
+                enableVibration(true)
+            }
+
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
         }
@@ -128,16 +163,33 @@ class CommandService : Service() {
                 iceCandidatesBuffer.clear()  // Wyczyść bufor po wysłaniu
             }
             command.startsWith("ice:") -> {
-                val parts = command.split(":")
-                if (parts.size == 4) {
-                    val candidate = IceCandidate(parts[1], parts[2].toInt(), parts[3])
-                    webRTCManager.handleIceCandidate(candidate)
-                    Log.d("CommandService", "Received and processed ICE candidate: ${candidate.sdp}")
+                Log.d("CommandService", "Processing ICE candidate from message: $command")
+
+                val parts = command.split(":", limit = 4)
+                if (parts.size == 4 && parts[3].startsWith("candidate")) {
+                    // Extract candidate details
+                    val sdpMid = parts[1]
+                    val sdpMLineIndex = parts[2].toIntOrNull()
+                    val candidate = parts[3]  // This is the full candidate string
+
+                    if (sdpMLineIndex != null) {
+                        val iceCandidate = IceCandidate(sdpMid, sdpMLineIndex, candidate)
+                        webRTCManager.handleIceCandidate(iceCandidate)
+                        Log.d("CommandService", "Received and processed ICE candidate: ${iceCandidate.sdp}")
+                    } else {
+                        Log.e("CommandService", "Invalid sdpMLineIndex in ICE candidate message: $command")
+                    }
+                } else {
+                    Log.e("CommandService", "Malformed ICE candidate message: $command")
                 }
             }
             else -> Log.d("WebSocket", "Unknown command: $command")
         }
     }
+
+
+
+
 
 
 
@@ -154,11 +206,11 @@ class CommandService : Service() {
         Log.d("CommandService", "Starting WebRTC session")
 
         val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()/*,
             PeerConnection.IceServer.builder("turn:freeturn.net:3478")
                 .setUsername("free")
                 .setPassword("free")
-                .createIceServer()
+                .createIceServer()*/
         )
 
         webRTCManager.startCall(iceServers, object : PeerConnection.Observer {

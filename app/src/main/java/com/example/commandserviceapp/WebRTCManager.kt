@@ -1,23 +1,59 @@
 package com.example.commandserviceapp
 
 import android.content.Context
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat
+import android.content.pm.PackageManager
+import android.Manifest
+import android.app.Activity
 import org.webrtc.*
 
-class WebRTCManager(context: Context) {
+class WebRTCManager(private val context: Context) {
 
     private val eglBase: EglBase = EglBase.create()
     private val peerConnectionFactory: PeerConnectionFactory
     private var peerConnection: PeerConnection? = null
     private val audioSource: AudioSource
     private val audioTrack: AudioTrack
-
+    private val iceCandidateBuffer = mutableListOf<IceCandidate>() // Bufor do kandydatów ICE
+    private var isRemoteDescriptionSet = false // Flaga oznaczająca, czy Remote SDP został ustawiony
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     init {
+        Log.d("WebRTCManager", "Initializing WebRTCManager")
+
+        // Sprawdzanie i żądanie uprawnień do nagrywania dźwięku
+        checkAudioPermissions()
+
+        // Ustawienie trybu audio na komunikację
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        Log.d("WebRTCManager", "AudioManager mode set to IN_COMMUNICATION")
+
+        // Obsługa urządzeń audio (np. wbudowany głośnik)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            devices.forEach { device ->
+                Log.d("WebRTCManager", "Output device: ${device.type}")
+            }
+            devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }?.let {
+                audioManager.isSpeakerphoneOn = true  // Zastąp setPreferredDevice na starszych wersjach
+                Log.d("WebRTCManager", "Speakerphone is set to ON")
+            }
+        } else {
+            // Dla starszych wersji Androida
+            audioManager.isSpeakerphoneOn = true
+            Log.d("WebRTCManager", "Speakerphone set to ON (legacy)")
+        }
+
         // Inicjalizacja PeerConnectionFactory
         val initializationOptions = PeerConnectionFactory.InitializationOptions.builder(context)
             .createInitializationOptions()
         PeerConnectionFactory.initialize(initializationOptions)
+        Log.d("WebRTCManager", "PeerConnectionFactory initialized")
 
         val options = PeerConnectionFactory.Options()
         peerConnectionFactory = PeerConnectionFactory.builder()
@@ -25,113 +61,162 @@ class WebRTCManager(context: Context) {
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
             .createPeerConnectionFactory()
+        Log.d("WebRTCManager", "PeerConnectionFactory created")
 
-        // Inicjalizacja AudioSource i AudioTrack, bez lokalnego nagrywania
-        val audioConstraints = MediaConstraints()
+        // Ustawienia dźwięku - Constraints (wyłączanie automatycznych funkcji WebRTC)
+        val audioConstraints = MediaConstraints().apply {
+            mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "false"))
+            mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "false"))
+            mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "false"))
+        }
+        Log.d("WebRTCManager", "Audio constraints set: $audioConstraints")
+
+        // Tworzymy AudioSource bazujące na MediaConstraints
         audioSource = peerConnectionFactory.createAudioSource(audioConstraints)
+        Log.d("WebRTCManager", "AudioSource created: $audioSource")
+
+        // Tworzymy AudioTrack na podstawie AudioSource
         audioTrack = peerConnectionFactory.createAudioTrack("ARDAMSa0", audioSource)
+        Log.d("WebRTCManager", "AudioTrack created: ${audioTrack.id()}")
 
-        // Inicjalizacja PeerConnection
-        peerConnection = peerConnectionFactory.createPeerConnection(listOf(), object : PeerConnection.Observer {
-            override fun onSignalingChange(state: PeerConnection.SignalingState) {
-                Log.d("WebRTCManager", "Signaling state changed: $state")
-            }
+        // Sprawdzenie właściwości AudioTrack
+        Log.d("WebRTCManager", "AudioTrack ID: ${audioTrack.id()}, kind: ${audioTrack.kind()}, enabled: ${audioTrack.enabled()}")
 
-            override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                Log.d("WebRTCManager", "ICE connection state changed: $state")
-            }
+        // Sprawdzenie i logowanie głośności
+        val volume = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        Log.d(
+            "WebRTCManager",
+            "Current VOICE_CALL stream volume: $volume (max=${audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)})"
+        )
+    }
 
-            override fun onIceConnectionReceivingChange(receiving: Boolean) {
-                Log.d("WebRTCManager", "ICE connection receiving change: $receiving")
-            }
+    private fun checkAudioPermissions() {
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.d("WebRTCManager", "Requesting RECORD_AUDIO permission")
+            ActivityCompat.requestPermissions(
+                context as Activity,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                1
+            )
+        } else {
+            Log.d("WebRTCManager", "RECORD_AUDIO permission already granted")
+        }
+    }
 
-            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-                Log.d("WebRTCManager", "ICE gathering state changed: $state")
-            }
+    private fun createPeerConnection(
+        iceServers: List<PeerConnection.IceServer>,
+        observer: PeerConnection.Observer
+    ) {
+        peerConnection?.close() // Upewnij się, że poprzednie połączenie jest zamknięte przed utworzeniem nowego
+        Log.d("WebRTCManager", "Creating PeerConnection with ICE servers: $iceServers")
 
-            override fun onIceCandidate(candidate: IceCandidate) {
-                Log.d("WebRTCManager", "New ICE candidate: ${candidate.sdp}")
-            }
+        peerConnection = peerConnectionFactory.createPeerConnection(iceServers, observer)
+            ?: throw NullPointerException("PeerConnection is null")
+        Log.d("WebRTCManager", "PeerConnection created")
 
-            override fun onIceCandidatesRemoved(candidates: Array<IceCandidate>) {
-                Log.d("WebRTCManager", "ICE candidates removed")
-            }
+        // Dodanie strumienia audio do PeerConnection
+        val sender = peerConnection?.addTrack(audioTrack)
+        if (sender != null) {
+            Log.d("WebRTCManager", "Audio track added to PeerConnection: ${audioTrack.id()}")
+        } else {
+            Log.e("WebRTCManager", "Failed to add audio track to PeerConnection")
+        }
 
-            override fun onAddStream(stream: MediaStream) {
-                Log.d("WebRTCManager", "Stream added: ${stream.id}")
-            }
+        // Potwierdzenie, że ścieżka audio jest włączona
+        Log.d("WebRTCManager", "Audio track enabled: ${audioTrack.enabled()}")
 
-            override fun onRemoveStream(stream: MediaStream) {
-                Log.d("WebRTCManager", "Stream removed: ${stream.id}")
-            }
-
-            override fun onDataChannel(channel: DataChannel) {
-                Log.d("WebRTCManager", "Data channel received: ${channel.label()}")
-            }
-
-            override fun onRenegotiationNeeded() {
-                Log.d("WebRTCManager", "Renegotiation needed")
-            }
-
-            override fun onAddTrack(receiver: RtpReceiver, streams: Array<MediaStream>) {
-                val trackKind = receiver.track()?.kind()
-                if (trackKind != null) {
-                    Log.d("WebRTCManager", "Track added: $trackKind")
-                } else {
-                    Log.w("WebRTCManager", "Track added, but kind is null")
-                }
-            }
-        })
-
-        peerConnection?.addTrack(audioTrack)
+        audioTrack.setEnabled(true)
+        Log.d("WebRTCManager", "Audio track enabled for transmission")
     }
 
     fun startCall(iceServers: List<PeerConnection.IceServer>, observer: PeerConnection.Observer) {
-        // Ponowna inicjalizacja PeerConnection z serwerami ICE
-        peerConnection = peerConnectionFactory.createPeerConnection(iceServers, observer)
-        peerConnection?.addTrack(audioTrack) ?: throw NullPointerException("PeerConnection is null")
+        // Log do potwierdzenia rozpoczęcia połączenia i rejestrowania dźwięku
+        Log.d("WebRTCManager", "Attempting to start call and register audio")
+
+        if (audioTrack != null) {
+            Log.d("WebRTCManager", "Audio track is set and ready for transmission")
+        } else {
+            Log.e("WebRTCManager", "Audio track is null, no audio will be transmitted")
+        }
+
+        createPeerConnection(iceServers, observer)
         Log.d("WebRTCManager", "Call started with ICE servers: $iceServers")
     }
 
     fun createOffer(sdpCallback: (String) -> Unit) {
         val mediaConstraints = MediaConstraints()
+        Log.d("WebRTCManager", "Creating offer with constraints: $mediaConstraints")
         peerConnection?.createOffer(object : SdpObserver {
             override fun onCreateSuccess(sdp: SessionDescription) {
                 Log.d("WebRTCManager", "Offer created: ${sdp.description}")
                 peerConnection?.setLocalDescription(object : SdpObserver {
-                    override fun onCreateSuccess(sdp: SessionDescription?) {}
+                    override fun onCreateSuccess(sdp: SessionDescription?) {
+                        Log.d("WebRTCManager", "Local description create success")
+                    }
+
                     override fun onSetSuccess() {
                         Log.d("WebRTCManager", "Local description set successfully")
-
-                        // Przekazanie SDP do CommandService przez callback
                         sdpCallback(sdp.description)
                     }
 
-                    override fun onCreateFailure(error: String?) {}
+                    override fun onCreateFailure(error: String?) {
+                        Log.e("WebRTCManager", "Failed to create local description: $error")
+                    }
+
                     override fun onSetFailure(error: String?) {
                         Log.e("WebRTCManager", "Failed to set local description: $error")
                     }
                 }, sdp)
             }
 
-            override fun onSetSuccess() {}
+            override fun onSetSuccess() {
+                Log.d("WebRTCManager", "Offer set success")
+            }
+
             override fun onCreateFailure(error: String) {
                 Log.e("WebRTCManager", "Failed to create offer: $error")
             }
 
-            override fun onSetFailure(error: String) {}
+            override fun onSetFailure(error: String) {
+                Log.e("WebRTCManager", "Failed to set offer: $error")
+            }
         }, mediaConstraints)
     }
 
-
     fun handleAnswer(sdp: SessionDescription) {
+        Log.d("WebRTCManager", "Handling remote SDP answer")
         peerConnection?.setRemoteDescription(object : SdpObserver {
-            override fun onCreateSuccess(sdp: SessionDescription?) {}
-            override fun onSetSuccess() {
-                Log.d("WebRTCManager", "Remote description set successfully")
+            override fun onCreateSuccess(sdp: SessionDescription?) {
+                Log.d("WebRTCManager", "Remote description create success")
             }
 
-            override fun onCreateFailure(error: String?) {}
+            override fun onSetSuccess() {
+                Log.d(
+                    "WebRTCManager",
+                    "Remote description set successfully, ready for audio transmission"
+                )
+                isRemoteDescriptionSet = true // Ustawienie flagi po ustawieniu Remote SDP
+
+                // Dodanie zbuforowanych kandydatów ICE
+                iceCandidateBuffer.forEach { candidate ->
+                    val success = peerConnection?.addIceCandidate(candidate)
+                    if (success == true) {
+                        Log.d("WebRTCManager", "Buffered ICE candidate added: ${candidate.sdp}")
+                    } else {
+                        Log.e("WebRTCManager", "Failed to add buffered ICE candidate: ${candidate.sdp}")
+                    }
+                }
+                iceCandidateBuffer.clear()
+            }
+
+            override fun onCreateFailure(error: String?) {
+                Log.e("WebRTCManager", "Failed to create remote description: $error")
+            }
+
             override fun onSetFailure(error: String?) {
                 Log.e("WebRTCManager", "Failed to set remote description: $error")
             }
@@ -139,7 +224,22 @@ class WebRTCManager(context: Context) {
     }
 
     fun handleIceCandidate(candidate: IceCandidate) {
-        peerConnection?.addIceCandidate(candidate)
-        Log.d("WebRTCManager", "ICE candidate added: ${candidate.sdp}")
+        if (isRemoteDescriptionSet) {
+            val success = peerConnection?.addIceCandidate(candidate)
+            if (success == true) {
+                Log.d("WebRTCManager", "ICE candidate added: ${candidate.sdp}")
+            } else {
+                Log.e("WebRTCManager", "Failed to add ICE candidate: ${candidate.sdp}")
+            }
+        } else {
+            iceCandidateBuffer.add(candidate)
+            Log.d("WebRTCManager", "Buffered ICE candidate: ${candidate.sdp}")
+        }
+    }
+
+    fun endCall() {
+        peerConnection?.close()
+        peerConnection = null
+        Log.d("WebRTCManager", "Call ended")
     }
 }
